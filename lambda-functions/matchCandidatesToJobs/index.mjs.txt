@@ -1,0 +1,138 @@
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { DynamoDBDocumentClient, GetCommand, ScanCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
+
+const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({ region: "ap-south-1" }));
+
+// ── JACCARD SIMILARITY ALGORITHM ─────────────────────────
+function jaccardSimilarity(setA, setB) {
+  // Convert to lowercase for comparison
+  const a = new Set(setA.map(s => s.toLowerCase()));
+  const b = new Set(setB.map(s => s.toLowerCase()));
+  
+  // Find intersection (skills in BOTH)
+  const intersection = new Set([...a].filter(x => b.has(x)));
+  
+  // Find union (ALL unique skills combined)
+  const union = new Set([...a, ...b]);
+  
+  // Calculate score (0 to 1)
+  return union.size === 0 ? 0 : intersection.size / union.size;
+}
+
+// ── MAIN HANDLER ─────────────────────────────────────────
+export const handler = async (event) => {
+  
+  // Get candidateId from the event
+  const candidateId = event.candidateId || event.Records?.[0]?.dynamodb?.Keys?.candidateId?.S;
+  
+  if (!candidateId) {
+    return {
+      statusCode: 400,
+      body: JSON.stringify({ error: "candidateId is required" })
+    };
+  }
+  
+  console.log(`Matching candidate: ${candidateId}`);
+  
+  try {
+    // Step 1: Get candidate from DynamoDB
+    const candidateResult = await dynamo.send(new GetCommand({
+      TableName: "candidates",
+      Key: { candidateId }
+    }));
+    
+    const candidate = candidateResult.Item;
+    
+    if (!candidate) {
+      return {
+        statusCode: 404,
+        body: JSON.stringify({ error: "Candidate not found" })
+      };
+    }
+    
+    console.log(`Found candidate: ${candidate.name}`);
+    console.log(`Candidate skills:`, candidate.skills);
+    
+    // Step 2: Get all active jobs from DynamoDB
+    const jobsResult = await dynamo.send(new ScanCommand({
+      TableName: "jobDescriptions",
+      FilterExpression: "#status = :active",
+      ExpressionAttributeNames: {
+        "#status": "status"
+      },
+      ExpressionAttributeValues: {
+        ":active": "active"
+      }
+    }));
+    
+    const jobs = jobsResult.Items || [];
+    console.log(`Found ${jobs.length} active jobs`);
+    
+    // Step 3: Score each job
+    const matches = jobs.map(job => {
+      const score = jaccardSimilarity(
+        candidate.skills || [],
+        job.requiredSkills || []
+      );
+      
+      // Find which skills matched
+      const candidateSkillsLower = (candidate.skills || []).map(s => s.toLowerCase());
+      const matchedSkills = (job.requiredSkills || [])
+        .filter(s => candidateSkillsLower.includes(s.toLowerCase()));
+      
+      // Find which skills are missing
+      const missingSkills = (job.requiredSkills || [])
+        .filter(s => !candidateSkillsLower.includes(s.toLowerCase()));
+      
+      // Determine recommendation level
+      let recommendation;
+      if (score >= 0.6) recommendation = "Strong Match";
+      else if (score >= 0.4) recommendation = "Good Match";
+      else if (score >= 0.2) recommendation = "Partial Match";
+      else recommendation = "Weak Match";
+      
+      return {
+        matchId: `${candidateId}-${job.jobId}`,
+        candidateId,
+        candidateName: candidate.name,
+        jobId: job.jobId,
+        jobTitle: job.title,
+        company: job.company,
+        location: job.location,
+        matchScore: Math.round(score * 100),
+        matchedSkills,
+        missingSkills,
+        recommendation,
+        createdAt: new Date().toISOString()
+      };
+    });
+    
+    // Step 4: Sort by score (best matches first)
+    matches.sort((a, b) => b.matchScore - a.matchScore);
+    
+    console.log(`Generated ${matches.length} matches`);
+    
+    // Step 5: Save all matches to DynamoDB
+    for (const match of matches) {
+      await dynamo.send(new PutCommand({
+        TableName: "matches",
+        Item: match
+      }));
+      console.log(`✅ Saved match: ${match.jobTitle} (${match.matchScore}%)`);
+    }
+    
+    return {
+      statusCode: 200,
+      body: JSON.stringify({
+        message: "Matching complete",
+        candidateName: candidate.name,
+        totalMatches: matches.length,
+        topMatch: matches[0]
+      })
+    };
+    
+  } catch (error) {
+    console.error("❌ Error:", error);
+    throw error;
+  }
+};

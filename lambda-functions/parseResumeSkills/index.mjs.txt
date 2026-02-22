@@ -1,0 +1,125 @@
+import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
+
+const s3 = new S3Client({ region: "ap-south-1" });
+const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({ region: "ap-south-1" }));
+
+// ── SKILLS LIST (add more anytime!) ──────────────────────────
+const SKILL_KEYWORDS = [
+  // Programming Languages
+  "python", "java", "javascript", "typescript", "c++", "c#", "ruby",
+  "php", "swift", "kotlin", "r", "matlab", "scala", "go",
+  // Web
+  "react", "angular", "vue", "node.js", "html", "css", "bootstrap",
+  "next.js", "express", "django", "flask", "spring",
+  // Data & AI
+  "sql", "mysql", "postgresql", "mongodb", "machine learning",
+  "deep learning", "data analysis", "tableau", "power bi",
+  "pandas", "numpy", "tensorflow", "pytorch",
+  // Cloud & DevOps
+  "aws", "azure", "gcp", "docker", "kubernetes", "git",
+  "jenkins", "ci/cd", "linux", "bash",
+  // Other
+  "excel", "figma", "photoshop", "agile", "scrum", "jira"
+];
+
+const JOB_TITLE_PATTERNS = [
+  /software engineer/i, /data (analyst|scientist|engineer)/i,
+  /web developer/i, /full.?stack/i, /frontend/i, /backend/i,
+  /project manager/i, /product manager/i, /devops/i,
+  /machine learning engineer/i, /ui\/ux/i, /designer/i,
+  /business analyst/i, /cloud engineer/i, /intern/i
+];
+
+// ── HELPER FUNCTIONS ─────────────────────────────────────────
+function extractSkills(text) {
+  const lower = text.toLowerCase();
+  return SKILL_KEYWORDS.filter(skill => lower.includes(skill));
+}
+
+function extractJobTitles(text) {
+  const titles = [];
+  JOB_TITLE_PATTERNS.forEach(pattern => {
+    const match = text.match(pattern);
+    if (match) titles.push(match[0]);
+  });
+  return [...new Set(titles)];
+}
+
+function extractYearsOfExperience(text) {
+  const patterns = [
+    /(\d+)\s*\+?\s*years?\s*(of\s*)?(experience|exp)/i,
+    /experience[:\s]+(\d+)\s*years?/i,
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match) return parseInt(match[1]);
+  }
+  return "Not specified";
+}
+
+function extractName(text) {
+  // First non-empty line is usually the candidate's name
+  const lines = text.split("\n").map(l => l.trim()).filter(l => l.length > 0);
+  return lines[0] || "Unknown";
+}
+
+function extractEmail(text) {
+  const match = text.match(/[\w.-]+@[\w.-]+\.\w+/);
+  return match ? match[0] : "Not found";
+}
+
+function extractPhone(text) {
+  const match = text.match(/(\+91[\s-]?)?[6-9]\d{9}/);
+  return match ? match[0] : "Not found";
+}
+
+// ── MAIN HANDLER ─────────────────────────────────────────────
+export const handler = async (event) => {
+
+  const bucket = event.Records[0].s3.bucket.name;
+  const key = decodeURIComponent(event.Records[0].s3.object.key.replace(/\+/g, ' '));
+
+  console.log(`Parsing file: ${key}`);
+
+  try {
+    // Step 1: Read the .txt file from S3 processed/ folder
+    const getCommand = new GetObjectCommand({ Bucket: bucket, Key: key });
+    const s3Response = await s3.send(getCommand);
+    const resumeText = await s3Response.Body.transformToString();
+
+    // Step 2: Extract all information
+    const parsed = {
+      candidateId:      `cand-${Date.now()}`,
+      name:             extractName(resumeText),
+      email:            extractEmail(resumeText),
+      phone:            extractPhone(resumeText),
+      skills:           extractSkills(resumeText),
+      jobTitles:        extractJobTitles(resumeText),
+      yearsExperience:  extractYearsOfExperience(resumeText),
+      sourceFile:       key,
+      parsedAt:         new Date().toISOString(),
+      status:           "parsed"
+    };
+
+    console.log("✅ Parsed result:", JSON.stringify(parsed, null, 2));
+
+    // Step 3: Save structured data to DynamoDB
+    await dynamo.send(new PutCommand({
+      TableName: "candidates",
+      Item: parsed
+    }));
+
+    console.log(`✅ Saved to DynamoDB: ${parsed.candidateId}`);
+
+    return {
+      statusCode: 200,
+      body: JSON.stringify(parsed)
+    };
+
+  } catch (error) {
+    console.error("❌ Error:", error);
+    throw error;
+  }
+};
